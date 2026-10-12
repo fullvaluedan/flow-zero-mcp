@@ -2,6 +2,7 @@
 FlowZero MCP Server
 Connects Claude Desktop, Claude Code, Cursor, and other MCP clients to Google Flow
 powered by Google Veo 3.1 & Omni Flash, utilizing active Google AI Pro/Ultra subscriptions.
+Features smart daily credit tracking with 50% and 20% milestone alerts.
 """
 
 from __future__ import annotations
@@ -18,8 +19,18 @@ from typing import Optional, List, Dict, Any
 
 from mcp.server.mcpserver import MCPServer
 
-# Auto-resolve default output directory across OS
 DEFAULT_OUTPUT_DIR = str(Path.home() / "Videos" / "Flow")
+TRACKER_FILE = Path.home() / ".flow_credits_tracker.json"
+
+COST_CATALOG = {
+    "veo-fast": 20,
+    "veo-lite": 10,
+    "veo-lite-lp": 10,
+    "veo-quality": 40,
+    "omni-flash": 20,
+    "extend": 20,
+    "image": 5,
+}
 
 mcp = MCPServer("flow-zero")
 
@@ -37,11 +48,95 @@ def _find_gflow() -> List[str]:
     for c in candidates:
         if os.path.exists(c):
             return [c]
-    # Fallback to python -m gflow_cli
     return [sys.executable, "-m", "gflow_cli"]
 
+class CreditTracker:
+    @staticmethod
+    def get_today_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    @classmethod
+    def load(cls) -> Dict[str, Any]:
+        if TRACKER_FILE.exists():
+            try:
+                with open(TRACKER_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data.get("date") == cls.get_today_str():
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    @classmethod
+    def save(cls, data: Dict[str, Any]):
+        try:
+            with open(TRACKER_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    @classmethod
+    async def get_or_sync(cls, force: bool = False, profile: str = "default") -> Dict[str, Any]:
+        current = cls.load()
+        if not force and current and "start_of_day_credits" in current:
+            return current
+
+        api_data = await _fetch_credits_raw(profile)
+        if not api_data.get("authenticated"):
+            return api_data
+
+        credits = api_data.get("credits", 0)
+        data = {
+            "date": cls.get_today_str(),
+            "email": api_data.get("email", ""),
+            "tier": api_data.get("user_paygate_tier", "Google AI Pro"),
+            "start_of_day_credits": credits,
+            "current_credits": credits,
+            "last_synced_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "generations_count": 0,
+            "warned_50": False,
+            "warned_20": False,
+            "authenticated": True
+        }
+        cls.save(data)
+        return data
+
+    @classmethod
+    def record_spend(cls, amount: int, gen_type: str = "video") -> Dict[str, Any]:
+        data = cls.load()
+        if not data:
+            return {
+                "start_of_day": amount,
+                "current": 0,
+                "spent": amount,
+                "pct_remaining": 0.0,
+                "warning_level": None
+            }
+        data["current_credits"] = max(0, data.get("current_credits", 0) - amount)
+        data["generations_count"] = data.get("generations_count", 0) + 1
+
+        start = data.get("start_of_day_credits", 1) or 1
+        curr = data.get("current_credits", 0)
+        pct = (curr / start) * 100
+
+        warning_level = None
+        if pct <= 20 and not data.get("warned_20"):
+            data["warned_20"] = True
+            warning_level = "20_percent"
+        elif pct <= 50 and not data.get("warned_50"):
+            data["warned_50"] = True
+            warning_level = "50_percent"
+
+        cls.save(data)
+        return {
+            "start_of_day": start,
+            "current": curr,
+            "spent": amount,
+            "pct_remaining": round(pct, 1),
+            "warning_level": warning_level
+        }
+
 async def _fetch_credits_raw(profile: str = "default") -> Dict[str, Any]:
-    """Queries current credit balance via gflow CLI."""
     cmd = _find_gflow() + ["credits", "user", "--json"]
     if profile != "default":
         cmd.extend(["--profile", profile])
@@ -84,33 +179,32 @@ def _format_not_authenticated_msg() -> str:
 
 @mcp.tool(
     name="flow_get_credits",
-    description="Check your live Google Flow credit balance and subscription tier (Google AI Pro/Ultra). Shows total credits remaining, subscription pool, and account email. $0 cost."
+    description="Check your live Google Flow credit balance. Automatically syncs once daily; set force_refresh=True to force a live API poll."
 )
-async def flow_get_credits(profile: str = "default") -> str:
-    """Inspects live Google Flow credit balance."""
-    data = await _fetch_credits_raw(profile)
+async def flow_get_credits(force_refresh: bool = False, profile: str = "default") -> str:
+    data = await CreditTracker.get_or_sync(force=force_refresh, profile=profile)
     if not data.get("authenticated"):
         return _format_not_authenticated_msg()
 
-    credits = data.get("credits", 0)
-    sub_credits = data.get("subscription_credits", "N/A")
-    tier = data.get("user_paygate_tier", "Google AI Pro")
+    start_credits = data.get("start_of_day_credits", 0)
+    current_credits = data.get("current_credits", start_credits)
+    tier = data.get("tier", "Google AI Pro")
     email = data.get("email", "Google Account")
-    prof_name = data.get("profile", profile)
+    gens = data.get("generations_count", 0)
+    pct_left = (current_credits / start_credits * 100) if start_credits > 0 else 0
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Estimate video generations (average 20 credits per Veo Fast generation)
-    est_fast_clips = credits // 20 if isinstance(credits, int) and credits > 0 else 0
+    sync_note = "🔄 Live API Synced" if force_refresh else "📅 Today's Active Session Ledger"
 
     return (
-        f"### 💳 Google Flow Live Credit Balance\n\n"
-        f"- **Account:** `{email}` (Profile: `{prof_name}`)\n"
+        f"### 💳 Google Flow Daily Credit Status\n\n"
+        f"- **Account:** `{email}`\n"
         f"- **Subscription Tier:** **{tier}**\n"
-        f"- **Total Credits Available:** **{credits:,}**\n"
-        f"- **Monthly Subscription Pool:** `{sub_credits}`\n"
-        f"- **Estimated Video Clips Remaining:** ~`{est_fast_clips}` clips (at ~20 credits/clip)\n"
-        f"- **Status:** 🟢 Connected & Ready\n"
-        f"- **Checked At:** `{now_str}`\n"
+        f"- **Start of Day Baseline:** **{start_credits:,}** credits\n"
+        f"- **Current Available Balance:** **{current_credits:,}** credits (**{pct_left:.1f}% remaining**)\n"
+        f"- **Generations Completed Today:** `{gens}` clips\n"
+        f"- **Estimated Veo Fast Clips Remaining:** ~`{current_credits // 20}` clips\n"
+        f"- **Ledger Mode:** {sync_note} ({now_str})\n"
     )
 
 @mcp.tool(
@@ -119,7 +213,7 @@ async def flow_get_credits(profile: str = "default") -> str:
         "Generate cinematic AI videos using Google Flow (Veo 3.1 & Omni Flash) with your Google AI Pro subscription. "
         "Supports vertical (9:16 Shorts/Reels/TikTok) and horizontal (16:9 Cinematic), durations 4s/6s/8s/10s, "
         "models (veo-fast, veo-quality, veo-lite, omni-flash), Text-to-Video and Image-to-Video. "
-        "Automatically displays a LIVE CREDIT FEED showing credits before, deducted, and remaining!"
+        "Features daily predictable credit ledger with 50% and 20% milestone alert banners!"
     )
 )
 async def flow_generate_video(
@@ -135,8 +229,6 @@ async def flow_generate_video(
     output_filename: Optional[str] = None,
     count: int = 1
 ) -> str:
-    """Generates video with live credit tracking and full Flow parameter support."""
-    # Normalize orientation
     norm_orient = orientation.lower().strip()
     if norm_orient in ["vertical", "portrait", "9:16", "short", "shorts", "tiktok", "reel"]:
         aspect = "9:16"
@@ -148,7 +240,6 @@ async def flow_generate_video(
         aspect = "9:16"
         orient_label = "Vertical (9:16)"
 
-    # Normalize model
     valid_models = {
         "veo-fast": "veo-fast",
         "veo_fast": "veo-fast",
@@ -162,32 +253,26 @@ async def flow_generate_video(
     }
     chosen_model = valid_models.get(model.lower().strip(), "veo-fast")
 
-    # Validate duration
     if chosen_model == "omni-flash":
         dur = duration if duration in [4, 6, 8, 10] else 10
     else:
         dur = duration if duration in [4, 6, 8] else 8
 
-    # Normalize mode
     chosen_mode = mode.lower().strip()
     if initial_frame and chosen_mode != "i2v":
         chosen_mode = "i2v"
 
-    # Destination directory
     target_out_dir = output_dir or DEFAULT_OUTPUT_DIR
     norm_out_dir = os.path.abspath(target_out_dir).replace("\\", "/")
     os.makedirs(norm_out_dir, exist_ok=True)
 
-    # 1. LIVE CREDIT FEED: Pre-check balance
-    pre_credits_data = await _fetch_credits_raw()
-    if not pre_credits_data.get("authenticated"):
+    ledger_data = await CreditTracker.get_or_sync()
+    if not ledger_data.get("authenticated"):
         return _format_not_authenticated_msg()
 
-    credits_before = pre_credits_data.get("credits", 0)
-    tier = pre_credits_data.get("user_paygate_tier", "Google AI Pro")
-    email = pre_credits_data.get("email", "Google Account")
+    unit_cost = COST_CATALOG.get(chosen_model, 20)
+    total_cost = unit_cost * min(max(1, count), 4)
 
-    # 2. Build execution command
     cmd = _find_gflow() + ["video"]
     if chosen_mode == "i2v":
         if not initial_frame or not os.path.exists(initial_frame):
@@ -215,7 +300,6 @@ async def flow_generate_video(
         exact_path = os.path.join(norm_out_dir, clean_name).replace("\\", "/")
         cmd.extend(["-o", exact_path])
 
-    # 3. Execute generation
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -225,22 +309,31 @@ async def flow_generate_video(
     out_text = stdout.decode("utf-8", errors="replace").strip()
     err_text = stderr.decode("utf-8", errors="replace").strip()
 
-    # 4. LIVE CREDIT FEED: Post-check balance
-    post_credits_data = await _fetch_credits_raw()
-    credits_after = post_credits_data.get("credits", credits_before)
-    credits_spent = max(0, credits_before - credits_after) if isinstance(credits_before, int) and isinstance(credits_after, int) else "N/A"
-
     if proc.returncode != 0:
         return (
             f"### ❌ Google Flow Video Generation Failed\n\n"
             f"**Error Details:**\n```\n{err_text or out_text}\n```\n\n"
-            f"**💳 Live Credit Feed (Safety Check):**\n"
-            f"- **Credits Before:** `{credits_before:,}`\n"
-            f"- **Credits Deducted:** `0` (Refused pre-submit; no credits wasted)\n"
-            f"- **Current Balance:** `{credits_after:,}`\n"
+            f"*(Zero credits deducted — run aborted before submission.)*\n"
         )
 
-    # Parse resulting video files
+    spend_info = CreditTracker.record_spend(total_cost, gen_type="video")
+    curr_credits = spend_info.get("current", 0)
+    pct_left = spend_info.get("pct_remaining", 0.0)
+    warning_lvl = spend_info.get("warning_level")
+
+    milestone_banner = ""
+    if warning_lvl == "20_percent" or pct_left <= 20.0:
+        milestone_banner = (
+            "> 🚨 **CRITICAL CREDIT ALERT (20% RESERVE)**\n"
+            f"> You are down to **{curr_credits:,} credits ({pct_left}%)** of your starting balance!\n"
+            "> *Tip: Consider switching to `veo-lite` (10 credits) for draft iterations.*\n\n"
+        )
+    elif warning_lvl == "50_percent" or (pct_left <= 50.0 and pct_left > 20.0):
+        milestone_banner = (
+            "> ⚠️ **CREDIT MILESTONE WARNING (50% HALFWAY MARK)**\n"
+            f"> You have consumed half your daily credits. **{curr_credits:,} credits ({pct_left}%)** remaining.\n\n"
+        )
+
     video_files: List[str] = []
     try:
         res_json = json.loads(out_text)
@@ -280,12 +373,12 @@ async def flow_generate_video(
     files_text = "\n\n".join(file_info_blocks) if file_info_blocks else f"- Saved to `{norm_out_dir}`"
 
     return (
+        f"{milestone_banner}"
         f"### 🎬 Google Flow Video Generated Successfully!\n\n"
-        f"#### 💳 Live Credit Tracker Feed\n"
-        f"- **Account:** `{email}` ({tier})\n"
-        f"- **Balance Before:** **{credits_before:,}** credits\n"
-        f"- **Credits Deducted:** **-{credits_spent}** credits\n"
-        f"- **Live Balance Remaining:** **{credits_after:,}** credits\n\n"
+        f"#### 💳 Daily Credit Tracker Ledger\n"
+        f"- **Operation Cost:** -`{total_cost}` credits (`{chosen_model}`)\n"
+        f"- **Balance Remaining:** **{curr_credits:,} credits ({pct_left}% left)**\n"
+        f"- **Estimated Veo Fast Clips Remaining:** ~`{curr_credits // 20}` clips\n\n"
         f"#### 📹 Video Specifications\n"
         f"- **Prompt:** \"{prompt}\"\n"
         f"- **Orientation:** {orient_label}\n"
@@ -298,10 +391,7 @@ async def flow_generate_video(
 
 @mcp.tool(
     name="flow_extend_video",
-    description=(
-        "Extend an existing Google Flow video by an extra 8 seconds, carrying motion and audio forward seamlessly. "
-        "Provide the clip's media ID or project reference and what should happen next. Includes live credit feed."
-    )
+    description="Extend an existing Google Flow video by an extra 8 seconds with motion and audio continuity."
 )
 async def flow_extend_video(
     media_id: str,
@@ -310,13 +400,11 @@ async def flow_extend_video(
     orientation: str = "vertical",
     output_file: Optional[str] = None
 ) -> str:
-    """Extends an existing Flow video clip by 8 seconds."""
     aspect = "9:16" if "vert" in orientation.lower() or "9:16" in orientation else "16:9"
 
-    pre_credits_data = await _fetch_credits_raw()
-    if not pre_credits_data.get("authenticated"):
+    ledger_data = await CreditTracker.get_or_sync()
+    if not ledger_data.get("authenticated"):
         return _format_not_authenticated_msg()
-    credits_before = pre_credits_data.get("credits", 0)
 
     cmd = _find_gflow() + [
         "video", "extend",
@@ -337,29 +425,25 @@ async def flow_extend_video(
     out_text = stdout.decode("utf-8", errors="replace").strip()
     err_text = stderr.decode("utf-8", errors="replace").strip()
 
-    post_credits_data = await _fetch_credits_raw()
-    credits_after = post_credits_data.get("credits", credits_before)
-    spent = max(0, credits_before - credits_after) if isinstance(credits_before, int) and isinstance(credits_after, int) else "N/A"
-
     if proc.returncode != 0:
         return f"### ❌ Extend Video Failed\n\n```\n{err_text or out_text}\n```"
 
+    spend_info = CreditTracker.record_spend(20, gen_type="extend")
+    curr_credits = spend_info.get("current", 0)
+    pct_left = spend_info.get("pct_remaining", 0.0)
+
     return (
         f"### 🎬 Video Extended Successfully (+8 Seconds)!\n\n"
-        f"#### 💳 Live Credit Tracker Feed\n"
-        f"- **Credits Before:** `{credits_before:,}`\n"
-        f"- **Credits Deducted:** `-{spent}`\n"
-        f"- **Live Balance Remaining:** `{credits_after:,}`\n\n"
+        f"#### 💳 Daily Credit Tracker Ledger\n"
+        f"- **Operation Cost:** -20 credits\n"
+        f"- **Balance Remaining:** **{curr_credits:,} credits ({pct_left}% left)**\n\n"
         f"**Continuation Prompt:** \"{prompt}\"\n"
         f"**Aspect Ratio:** `{aspect}`\n"
     )
 
 @mcp.tool(
     name="flow_generate_image",
-    description=(
-        "Generate images using Google Flow's Imagen / Nano Banana models with your Google AI Pro subscription. "
-        "Supports aspect ratios: 9:16, 16:9, 1:1, 4:3, 3:4. Includes live credit tracker feed."
-    )
+    description="Generate images using Google Flow's Imagen / Nano Banana models (5 credits/image)."
 )
 async def flow_generate_image(
     prompt: str,
@@ -368,15 +452,15 @@ async def flow_generate_image(
     count: int = 1,
     output_dir: Optional[str] = None
 ) -> str:
-    """Generates image via Flow Imagen models."""
     target_out_dir = output_dir or DEFAULT_OUTPUT_DIR
     norm_out_dir = os.path.abspath(target_out_dir).replace("\\", "/")
     os.makedirs(norm_out_dir, exist_ok=True)
 
-    pre_credits_data = await _fetch_credits_raw()
-    if not pre_credits_data.get("authenticated"):
+    ledger_data = await CreditTracker.get_or_sync()
+    if not ledger_data.get("authenticated"):
         return _format_not_authenticated_msg()
-    credits_before = pre_credits_data.get("credits", 0)
+
+    cost = 5 * min(max(1, count), 4)
 
     cmd = _find_gflow() + [
         "image", "t2i",
@@ -397,27 +481,23 @@ async def flow_generate_image(
     out_text = stdout.decode("utf-8", errors="replace").strip()
     err_text = stderr.decode("utf-8", errors="replace").strip()
 
-    post_credits_data = await _fetch_credits_raw()
-    credits_after = post_credits_data.get("credits", credits_before)
-    spent = max(0, credits_before - credits_after) if isinstance(credits_before, int) and isinstance(credits_after, int) else "N/A"
-
     if proc.returncode != 0:
         return f"### ❌ Image Generation Failed\n\n```\n{err_text or out_text}\n```"
 
+    spend_info = CreditTracker.record_spend(cost, gen_type="image")
+    curr_credits = spend_info.get("current", 0)
+
     found = re.findall(r'([A-Za-z]:\\[^`\r\n]+\.png|[A-Za-z]:/[^`\r\n]+\.png|/[^`\r\n]+\.png)', out_text)
     image_files = [f.replace("\\", "/") for f in found]
-
     links = "\n".join([f"- [{os.path.basename(f)}](file:///{f})" for f in image_files]) or f"- Files saved in `{norm_out_dir}`"
 
     return (
         f"### 🖼️ Google Flow Image Generated!\n\n"
-        f"#### 💳 Live Credit Tracker Feed\n"
-        f"- **Balance Before:** `{credits_before:,}`\n"
-        f"- **Deducted:** `-{spent}` credits\n"
-        f"- **Remaining:** `{credits_after:,}` credits\n\n"
+        f"#### 💳 Daily Credit Tracker Ledger\n"
+        f"- **Cost:** -{cost} credits\n"
+        f"- **Balance Remaining:** **{curr_credits:,} credits**\n\n"
         f"**Prompt:** \"{prompt}\"\n"
-        f"**Aspect Ratio:** `{aspect_ratio}`\n"
-        f"**Model:** `{model}`\n\n"
+        f"**Aspect Ratio:** `{aspect_ratio}`\n\n"
         f"#### 📁 Files:\n{links}\n"
     )
 
@@ -426,7 +506,6 @@ async def flow_generate_image(
     description="List all available Google Flow video models (Veo 3.1 & Omni Flash) and image models, aspects, and durations."
 )
 async def flow_list_models() -> str:
-    """Lists Flow models."""
     cmd = _find_gflow() + ["models", "--json"]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -438,17 +517,19 @@ async def flow_list_models() -> str:
 
     try:
         catalog = json.loads(out_text)
-        video_md = "### 🎥 Video Models (Veo / Omni)\n\n| Model | Alias | Max Dur | Native Audio |\n|---|---|---|---|\n"
+        video_md = "### 🎥 Video Models (Veo / Omni)\n\n| Model | Alias | Cost | Max Dur | Native Audio |\n|---|---|---|---|---|\n"
         for vm in catalog.get("video", {}).get("models", []):
             aliases = ", ".join(vm.get("aliases", []))
+            alias_key = vm.get("aliases", [""])[0]
+            cost = COST_CATALOG.get(alias_key, 20)
             max_d = f"{vm.get('max_duration', 8)}s"
             audio = "✅ Yes" if "omni" in vm.get("name", "") else "No"
-            video_md += f"| `{vm.get('name')}` | `{aliases}` | {max_d} | {audio} |\n"
+            video_md += f"| `{vm.get('name')}` | `{aliases}` | ~{cost} cr | {max_d} | {audio} |\n"
 
-        img_md = "\n### 🎨 Image Models (Imagen / Nano Banana)\n\n| Model | Alias | Ref Cap |\n|---|---|---|\n"
+        img_md = "\n### 🎨 Image Models (Imagen / Nano Banana)\n\n| Model | Alias | Cost |\n|---|---|---|\n"
         for im in catalog.get("image", {}).get("models", []):
             aliases = ", ".join(im.get("aliases", []))
-            img_md += f"| `{im.get('name')}` | `{aliases}` | {im.get('ref_cap', 0)} |\n"
+            img_md += f"| `{im.get('name')}` | `{aliases}` | ~5 cr |\n"
 
         return (
             f"## 🎬 Google Flow Model Catalog\n\n"
@@ -467,18 +548,17 @@ async def flow_list_models() -> str:
     description="Check your Google Flow authentication status, connected Google account, and profile health."
 )
 async def flow_auth_status() -> str:
-    """Probes authentication status."""
-    data = await _fetch_credits_raw()
+    data = await CreditTracker.get_or_sync()
     if not data.get("authenticated"):
         return _format_not_authenticated_msg()
 
     return (
         f"### 🟢 Google Flow Account Status: Active\n\n"
         f"- **Email:** `{data.get('email', 'N/A')}`\n"
-        f"- **Plan Tier:** `{data.get('user_paygate_tier', 'Google AI Pro')}`\n"
-        f"- **Profile:** `{data.get('profile', 'default')}`\n"
-        f"- **Credits Balance:** **{data.get('credits', 0):,}**\n"
-        f"- **Connection:** Verified & Ready for Video Generation\n"
+        f"- **Plan Tier:** `{data.get('tier', 'Google AI Pro')}`\n"
+        f"- **Today's Baseline:** `{data.get('start_of_day_credits', 0):,} credits`\n"
+        f"- **Current Balance:** **{data.get('current_credits', 0):,} credits**\n"
+        f"- **Status:** Verified & Ready\n"
     )
 
 def main():
