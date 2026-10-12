@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output media files
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.gif
+videos/
+tmp/
+
+# Session & credentials (CRITICAL: never commit Google cookies or sessions)
+storage_state.json
+*.session
+*.cookie
+.env
+.env.*

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flow-zero-mcp"
+version = "0.1.0"
+description = "Zero-cost Google Veo AI Video Generation, Live Credit Feed, and Parameter Parity MCP Server for Claude, Cursor, and Agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Community", email = "dev@example.com" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "google-flow",
+    "veo",
+    "ai-video",
+    "claude",
+    "claude-desktop",
+    "imagen",
+    "google-ai-pro"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "gflow-cli>=0.83.0",
+]
+
+[project.scripts]
+flow-zero-mcp = "flow_zero.server:main"
+flow-zero-login = "flow_zero.auth:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flow_zero"]
